@@ -443,16 +443,37 @@ with tabs[0]:
             st.success(f"Загрузка завершена. Новых материалов: {count}")
 
 with tabs[1]:
-    st.header("AI-Модерация и семантика")
+    st.header("Аналитический цикл")
     repo_dir = st.session_state['repo_path']
-    files = [f for f in os.listdir(repo_dir)] if os.path.exists(repo_dir) else []
-    if not files: st.warning("Хранилище пусто. Загрузите файлы на первой вкладке.")
+    all_files = [f for f in os.listdir(repo_dir)] if os.path.exists(repo_dir) else []
+    
+    if not all_files: 
+        st.warning("Хранилище пусто. Загрузите файлы на первой вкладке.")
     else:
-        st.info(f"Объектов в очереди (папка {repo_dir}): **{len(files)}**")
-        if st.button("Запустить цикл анализа"):
+        # Section 1: AI Moderation with Interactivity
+        st.subheader("1. Интеллектуальная модерация (OpenRouter)")
+        st.info("Анализ контента, извлечение тем и формирование справок.")
+        
+        # Identify available extensions
+        available_exts = sorted(list(set([os.path.splitext(f)[1].lower() for f in all_files if os.path.splitext(f)[1]])))
+        
+        col_f1, col_f2 = st.columns([2, 1])
+        with col_f1:
+            selected_exts = st.multiselect("Выберите типы файлов для анализа", available_exts, default=available_exts)
+        with col_f2:
+            limit_files = st.number_input("Лимит файлов (0 - без лимита)", min_value=0, value=0)
+
+        # Filter the file list
+        files_to_process = [f for f in all_files if os.path.splitext(f)[1].lower() in selected_exts]
+        if limit_files > 0:
+            files_to_process = files_to_process[:limit_files]
+
+        st.write(f"Объектов к обработке: **{len(files_to_process)}** (отфильтровано из {len(all_files)})")
+        
+        if st.button("Запустить AI-модерацию выбранных файлов"):
             prog = st.progress(0); status = st.empty()
-            for i, fname in enumerate(files):
-                fpath = os.path.join(repo_dir, fname); status.text(f"Анализ: {fname}")
+            for i, fname in enumerate(files_to_process):
+                fpath = os.path.join(repo_dir, fname); status.text(f"Анализ ({i+1}/{len(files_to_process)}): {fname}")
                 txt, imgs = extract_content(fpath)
                 
                 # Full AI Analysis with detailed metrics
@@ -489,31 +510,88 @@ with tabs[1]:
                 with engine.begin() as conn:
                     conn.execute(text("DELETE FROM opit_files WHERE id = :id"), {"id": row['id']})
                     pd.DataFrame([row]).to_sql("opit_files", conn, if_exists="append", index=False)
-                prog.progress((i+1)/len(files))
-            
-            df_final = pd.read_sql("SELECT * FROM opit_files", engine)
-            df_linked = calculate_thematic_links(df_final)
-            for _, r in df_linked.iterrows():
-                with engine.begin() as conn:
-                    conn.execute(text("UPDATE opit_files SET embedding_order=:o, has_previous=:p, has_next=:n WHERE id=:id"),
-                                 {"o":int(r['embedding_order']), "p":bool(r['has_previous']), "n":bool(r['has_next']), "id":r['id']})
-            st.success("Обработка завершена.")
+                prog.progress((i+1)/len(files_to_process))
+            st.success("Модерация выбранных файлов завершена.")
+
+        st.markdown("---")
+        
+        # Section 2: Semantic Linkage
+        st.subheader("2. Семантическое связывание (Эмбеддинги)")
+        st.info("Расчет тематической близости и выстраивание логической последовательности.")
+        
+        if st.button("Обновить логические связи в базе"):
+            try:
+                df_final = pd.read_sql("SELECT * FROM opit_files", engine)
+                if df_final.empty:
+                    st.error("База данных пуста. Сначала проведите модерацию.")
+                else:
+                    with st.spinner("Рассчитываем эмбеддинги..."):
+                        df_linked = calculate_thematic_links(df_final)
+                        for _, r in df_linked.iterrows():
+                            with engine.begin() as conn:
+                                conn.execute(text("UPDATE opit_files SET embedding_order=:o, has_previous=:p, has_next=:n WHERE id=:id"),
+                                             {"o":int(r['embedding_order']), "p":bool(r['has_previous']), "n":bool(r['has_next']), "id":r['id']})
+                        st.success("Семантическая структура репозитория обновлена.")
+            except Exception as e:
+                st.error(f"Ошибка при связывании: {e}")
 
 with tabs[2]:
     st.header("Репозиторий объектов")
-    search = st.text_input("Поиск по базе знаний")
+    search = st.text_input("Поиск по базе знаний (названия, контент, аннотации)")
     try:
         df_repo = pd.read_sql("SELECT * FROM opit_files ORDER BY embedding_order", engine)
         if not df_repo.empty:
-            if search: df_repo = df_repo[df_repo['text_content'].str.contains(search, case=False) | df_repo['annotation'].str.contains(search, case=False)]
+            if search: 
+                mask = (df_repo['text_content'].str.contains(search, case=False, na=False) | 
+                        df_repo['annotation'].str.contains(search, case=False, na=False) |
+                        df_repo['file_name'].str.contains(search, case=False, na=False))
+                df_repo = df_repo[mask]
+            
             for _, r in df_repo.iterrows():
-                with st.expander(f"{r['file_name']} | Качество: {int(r['compliance_rate']*100)}%"):
-                    st.markdown(f"**Предмет:** {r['subject']} | **Тема:** {r['topic']}")
-                    st.write(r['annotation'])
-                    st.info(f"Связи: {'Предшествующий' if r['has_previous'] else 'Первый'} -> {'Последующий' if r['has_next'] else 'Последний'}")
-                    st.code(f"ЗАМЕЧАНИЯ: {r['issues']}\nСОВЕТЫ: {r['recommendations']}")
-        else: st.info("База пуста.")
-    except: pass
+                with st.expander(f"{r['file_name']} | Предмет: {r['subject'] or 'Не определен'} | Рейтинг: {int(r['compliance_rate']*100)}%"):
+                    st.markdown(f"### Тема: {r['topic']}")
+                    st.write(f"**Аннотация:** {r['annotation']}")
+                    
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        if not r['has_previous'] and r['has_next']:
+                            st.warning("Статус: Вводный материал (Начало курса)")
+                        elif r['has_previous'] and r['has_next']:
+                            st.info("Статус: Промежуточный материал")
+                        elif r['has_previous'] and not r['has_next']:
+                            st.success("Статус: Завершающий материал (Конец курса)")
+                        else:
+                            st.write("Логические связи не определены")
+                    
+                    with c2:
+                        st.write(f"**Допуск к использованию:** {'ДА' if r['usage_allowed']=='yes' else 'НЕТ'}")
+                    
+                    # Formatted Lists
+                    col_iss, col_rec = st.columns(2)
+                    with col_iss:
+                        st.markdown("**Критические замечания:**")
+                        try:
+                            iss = json.loads(r['issues'])
+                            if isinstance(iss, list) and iss:
+                                for item in iss: st.write(f"• {item}")
+                            else: st.write("Замечаний нет")
+                        except: st.write(r['issues'])
+                    
+                    with col_rec:
+                        st.markdown("**Методические рекомендации:**")
+                        try:
+                            recs = json.loads(r['recommendations'])
+                            if isinstance(recs, list) and recs:
+                                for item in recs: st.write(f"• {item}")
+                            else: st.write("Рекомендаций нет")
+                        except: st.write(r['recommendations'])
+                        
+                    if st.checkbox("Показать извлеченный текст документа", key=f"txt_{r['id']}"):
+                        st.text_area("Raw Text", value=r['text_content'][:5000], height=300)
+        else: 
+            st.info("База знаний пуста. Проведите анализ на предыдущей вкладке.")
+    except Exception as e:
+        st.error(f"Ошибка загрузки репозитория: {e}")
 
 with tabs[3]:
     st.header("Статистика и Экспорт")
