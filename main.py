@@ -1,4 +1,4 @@
-import os
+﻿import os
 import hashlib
 import requests
 import json
@@ -17,6 +17,34 @@ from datetime import datetime
 from bs4 import BeautifulSoup
 import altair as alt
 from urllib.parse import urljoin
+import seaborn as sns
+import matplotlib.pyplot as plt
+import plotly.express as px
+from sklearn.ensemble import RandomForestRegressor
+import shap
+import matplotlib
+import mammoth
+from streamlit_adjustable_columns import adjustable_columns
+from streamlit_theta import theta_spreadsheet_editor, theta_image_editor
+from streamlit_quill import st_quill
+from html2docx import html2docx
+matplotlib.use('Agg') # Ensure non-interactive backend for Streamlit
+
+# --- PATCH FOR OLD STREAMLIT VERSIONS ---
+# Fixes: TypeError: columns() got an unexpected keyword argument 'vertical_alignment'/'border'/'gap'
+# Fixes: AttributeError: module 'streamlit' has no attribute 'rerun'
+# This happens because streamlit-adjustable-columns assumes a newer Streamlit API
+if not hasattr(st, 'rerun'):
+    st.rerun = st.experimental_rerun
+
+_original_st_columns = st.columns
+def _patched_st_columns(*args, **kwargs):
+    # Strip all arguments introduced in newer Streamlit versions
+    kwargs.pop('vertical_alignment', None)
+    kwargs.pop('gap', None)
+    kwargs.pop('border', None)
+    return _original_st_columns(*args, **kwargs)
+st.columns = _patched_st_columns
 
 # --- CONFIG ---
 st.set_page_config(
@@ -153,6 +181,35 @@ st.markdown("""
         color: #c9d1d9 !important;
         font-size: 17px !important;
     }
+
+    /* Sandbox & Editor Styles */
+    .doc-container {
+        background-color: white;
+        color: black;
+        padding: 40px;
+        border-radius: 5px;
+        overflow-y: auto;
+        max-height: 800px;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+    }
+    .ql-container { 
+        background-color: white !important; 
+        color: black !important; 
+        font-size: 16px !important; 
+        height: 600px !important; 
+    }
+    .ql-toolbar { background-color: #f0f0f0 !important; }
+    
+    .react-resizable-handle {
+        background-color: #30363d !important;
+        width: 6px !important;
+        height: 100vh !important;
+        top: 0 !important;
+        right: -3px !important;
+        cursor: col-resize !important;
+        opacity: 0.5;
+    }
+    .react-resizable-handle:hover { background-color: #f9a03f !important; opacity: 1; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -167,9 +224,19 @@ if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
 TARGET_URL = "https://cchgeu.ru/education/programms/planned/rupo-9kl-4/?docs2026"
 TEXT_MODEL = "google/gemini-2.0-flash-lite-001"
 
+# --- HELPERS FOR GENERATION TAB ---
+def display_pdf(file_bytes):
+    base64_pdf = base64.b64encode(file_bytes).decode('utf-8')
+    pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="800" type="application/pdf"></iframe>'
+    st.markdown(pdf_display, unsafe_allow_html=True)
+
+def display_docx(file_bytes):
+    result = mammoth.convert_to_html(io.BytesIO(file_bytes))
+    st.markdown(f'<div class="doc-container">{result.value}</div>', unsafe_allow_html=True)
+
 # --- PROMPTS ---
 METHODOLOGY_PROMPT = """Оцени ЭОМ (электронный образовательный материал) по критериям:
-АВТОМАТИЧЕСКИЕ: описание заполнено; указаны темы/дидактические единицы; >=6 фрагментов; экраны заполнены; шрифт>=22пт; заимствование<=20%; текст не выходит за слайд; названия и время фрагментов указаны.
+АВТОМАТИЧЕСКИЕ: описание заполнено; указаны темы/дидактические единицы; >=6 фрагментов; экраны заполнено; шрифт>=22пт; заимствование<=20%; текст не выходит за слайд; названия и время фрагментов указаны.
 НОРМАТИВНО-ПРАВОВЫЕ: соответствие ФГОС; защита детей (436-ФЗ); нет противоречий Конституции РФ; нет экстремизма; актуальные НПА; корректные карты/границы РФ; соответствие ГК РФ ст.1274,1259; гражданская идентичность.
 НОРМАТИВНО-ТЕХНИЧЕСКИЕ: соответствие ТУ/регламентам; актуальные стандарты и СанПиН.
 МЕТОДОЛОГИЧЕСКИЕ: последовательность и завершённость; логичность; практико-ориентированность; критерии оценивания; практические задания; современные тенденции; потребности рынка труда; новые технологии; междисциплинарность; экология; критическое мышление; активное обучение; деятельностный подход.
@@ -178,30 +245,30 @@ METHODOLOGY_PROMPT = """Оцени ЭОМ (электронный образов
 Верни JSON: {"compliance_rate":0-1,"structure":0-5,"clarity":0-5,"terminology":0-5,"completeness":0-5,"practice_orientation":0-5,"legal_compliance":0-5,"technical_quality":0-5,"subject":"","topic":"","annotation":"","material_type":"","issues":[],"recommendations":[],"usage_allowed": "yes/no"}"""
 
 # --- CORE LOGIC ---
-@st.experimental_singleton(show_spinner=False)
-def get_embedding_model():
-    from sentence_transformers import SentenceTransformer
-    return SentenceTransformer('intfloat/multilingual-e5-small')
-
 def calculate_thematic_links(df):
     if df.empty or len(df) < 2: return df
     try:
-        model = get_embedding_model()
-        texts = [f"passage: {r.get('topic','')} {r.get('annotation','')}" for _, r in df.iterrows()]
-        embs = model.encode(texts, convert_to_numpy=True)
-        n = len(df)
-        sims = (embs / (np.linalg.norm(embs, axis=1, keepdims=True) + 1e-12)) @ (embs / (np.linalg.norm(embs, axis=1, keepdims=True) + 1e-12)).T
-        path = [0]; visited = {0}
-        for _ in range(n-1):
-            last = path[-1]
-            candidates = [i for i in range(n) if i not in visited]
-            next_idx = candidates[np.argmax(sims[last, candidates])]
-            path.append(next_idx); visited.add(next_idx)
-        order = np.argsort(path)
-        df['embedding_order'] = order
-        df['has_previous'] = df['embedding_order'] > 0
-        df['has_next'] = df['embedding_order'] < (n-1)
-    except: pass
+        # Prep data for AI with null-safety
+        topics_list = []
+        for _, r in df.iterrows():
+            t = str(r['topic']) if r['topic'] else "Без темы"
+            a = str(r['annotation'])[:200] if r['annotation'] else "Без описания"
+            topics_list.append({"id": r['id'], "topic": t, "annotation": a})
+        
+        prompt = f"""Ты - эксперт-методист. Выстрой логический порядок изучения следующих тем учебного курса от простого к сложному. 
+        Верни ТОЛЬКО JSON-список ID в правильном порядке, например: ["id1", "id2", "id3"].
+        Вот темы: {json.dumps(topics_list, ensure_ascii=False)}"""
+        
+        ordered_ids = call_ai(prompt, is_json=True)
+        
+        if isinstance(ordered_ids, list):
+            # Create a mapping from ID to its order in the list
+            order_map = {str(id_): i for i, id_ in enumerate(ordered_ids)}
+            df['embedding_order'] = df['id'].map(order_map).fillna(999)
+            df['has_previous'] = df['embedding_order'] > 0
+            df['has_next'] = df['embedding_order'] < (len(ordered_ids) - 1)
+    except Exception as e:
+        st.error(f"Ошибка AI-сортировки: {e}")
     return df
 
 def get_document_links(url):
@@ -246,8 +313,63 @@ def extract_content(fpath):
                     if sh.shape_type == 13: imgs += 1
         elif ext in ['.csv', '.xlsx']:
             df = pd.read_csv(fpath) if ext == '.csv' else pd.read_excel(fpath); text = df.to_string()
+        elif ext in ['.mp3', '.wav', '.mp4', '.m4a']:
+            text = process_media_content(fpath)
     except: pass
     return text, imgs
+
+def process_media_content(fpath):
+    # Specialized logic for transcribing audio/video via AI
+    from moviepy import VideoFileClip, AudioFileClip
+    import tempfile
+    
+    ext = os.path.splitext(fpath)[1].lower()
+    temp_audio = os.path.join(tempfile.gettempdir(), f"temp_audio_{hashlib.md5(fpath.encode()).hexdigest()}.mp3")
+    
+    try:
+        if ext == '.mp4':
+            video = VideoFileClip(fpath)
+            if video.audio:
+                video.audio.write_audiofile(temp_audio, codec='libmp3lame', verbose=False, logger=None)
+            video.close()
+        else:
+            audio = AudioFileClip(fpath)
+            audio.write_audiofile(temp_audio, codec='libmp3lame', verbose=False, logger=None)
+            audio.close()
+            
+        if os.path.exists(temp_audio):
+            with open(temp_audio, "rb") as f:
+                audio_b64 = base64.b64encode(f.read()).decode('utf-8')
+            
+            # Using Gemini to transcribe. Note: Large files might hit API limits.
+            # We send a multimodal prompt if the model supports it.
+            # For simplicity in this prototype, we'll ask Gemini to act as a transcriber.
+            prompt = "Ты - эксперт по транскрибации. Переложи содержание этого аудиофайла в подробный текстовый конспект лекции. Сохрани все ключевые термины и структуру."
+            
+            h = {"Authorization": f"Bearer {AI_API_KEY}"}
+            payload = {
+                "model": TEXT_MODEL,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image_url", # OpenRouter often uses image_url for any data block or specific multimodal formats
+                                "image_url": {"url": f"data:audio/mp3;base64,{audio_b64}"}
+                            }
+                        ]
+                    }
+                ]
+            }
+            # Note: Many OpenRouter models support this via standard data URLs
+            r = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=h, json=payload, timeout=120).json()
+            return r['choices'][0]['message']['content'].strip()
+    except Exception as e:
+        return f"Ошибка обработки медиа: {e}"
+    finally:
+        if os.path.exists(temp_audio): os.remove(temp_audio)
+    return ""
 
 def call_ai(prompt, is_json=False):
     h = {"Authorization": f"Bearer {AI_API_KEY}"}
@@ -308,9 +430,11 @@ if 'repo_path' not in st.session_state:
 
 # --- UI ---
 st.title("Sapere Intelligence")
-tabs = st.tabs(["Загрузка материалов", "Аналитический цикл", "Репозиторий", "Набор данных"])
+tabs = st.tabs(["Загрузка материалов", "Аналитический цикл", "Репозиторий", "Набор данных", "Генерация и Редактор"])
 
 with tabs[0]:
+# (rest of code stays same until the end)
+
     st.header("Управление хранилищем")
     
     # Custom Path Selection
@@ -593,16 +717,325 @@ with tabs[2]:
     except Exception as e:
         st.error(f"Ошибка загрузки репозитория: {e}")
 
+@st.experimental_memo(show_spinner=False)
+def prepare_analysis_df(df):
+    if df.empty: return df
+    
+    # Feature Engineering
+    def get_stats(txt):
+        if not txt or not isinstance(txt, str): return 0, 0, 0, 0, 0, 0
+        words = re.findall(r'\w+', txt.lower())
+        sentences = re.split(r'[.!?]+', txt)
+        w_count = len(words)
+        s_count = len(sentences) if len(sentences) > 0 else 1
+        avg_w_len = np.mean([len(w) for w in words]) if w_count > 0 else 0
+        avg_s_len = w_count / s_count if s_count > 0 else 0
+        
+        # Simple complexity metrics
+        unique_words = len(set(words))
+        term_density = unique_words / w_count if w_count > 0 else 0
+        complexity = (avg_w_len * 0.5) + (avg_s_len * 0.5)
+        
+        return w_count, s_count, avg_w_len, avg_s_len, term_density, complexity
+
+    stats = df['text_content'].apply(get_stats)
+    df[['word_count', 'sentence_count', 'avg_word_length', 'avg_sentence_length', 'term_density', 'complexity']] = pd.DataFrame(stats.tolist(), index=df.index)
+    
+    # Fill numeric NaNs
+    num_cols = df.select_dtypes(include=[np.number]).columns
+    df[num_cols] = df[num_cols].fillna(0)
+    
+    return df
+
+@st.experimental_memo(show_spinner=False)
+def train_and_get_shap(df):
+    features = ['text_length', 'word_count', 'avg_word_length', 'sentence_count', 'avg_sentence_length', 'term_density', 'complexity']
+    X = df[features]
+    y = df['compliance_rate']
+    
+    model = RandomForestRegressor(n_estimators=100, random_state=42)
+    model.fit(X, y)
+    
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(X)
+    
+    # Importance df
+    imp_df = pd.DataFrame({'Feature': features, 'Importance': model.feature_importances_}).sort_values('Importance')
+    
+    return model, shap_values, imp_df, X
+
 with tabs[3]:
-    st.header("Статистика и Экспорт")
+    st.header("Глубинная аналитика датасета")
+    
     try:
-        df_stat = pd.read_sql("SELECT * FROM opit_files", engine)
-        if not df_stat.empty:
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Всего", len(df_stat)); m2.metric("Ср. Качество", round(df_stat['compliance_rate'].mean(), 2)); m3.metric("Допущено", len(df_stat[df_stat['usage_allowed'] == 'yes']))
-            st.subheader("Корреляционная матрица")
-            st.write(df_stat.select_dtypes(include=[np.number]).corr())
-            csv = df_stat.to_csv(index=False).encode('utf-8-sig')
-            st.download_button("Выгрузить датасет (CSV)", csv, "dataset.csv", "text/csv")
-        else: st.info("Нет данных.")
-    except: pass
+        raw_df = pd.read_sql("SELECT * FROM opit_files", engine)
+        if raw_df.empty:
+            st.info("Нет данных для анализа. Проведите модерацию во вкладке 'Аналитический цикл'.")
+        else:
+            df = prepare_analysis_df(raw_df)
+            
+            # --- TOP METRICS ---
+            m1, m2, m3, m4 = st.columns(4)
+            with m1:
+                st.metric("Объектов", len(df))
+            with m2:
+                st.metric("Средний Score", f"{df['compliance_rate'].mean():.2%}")
+            with m3:
+                st.metric("Допущено", len(df[df['usage_allowed'] == 'yes']))
+            with m4:
+                st.metric("Средняя сложность", f"{df['complexity'].mean():.1f}")
+            
+            st.markdown("---")
+            
+            # --- 1. DETAILED DATA TABLE ---
+            st.subheader("1. Детализированный реестр базы данных")
+            
+            # Dynamic Column Selector
+            all_cols = df.columns.tolist()
+            default_cols = ['file_name', 'subject', 'compliance_rate', 'word_count', 'complexity', 'usage_allowed']
+            
+            with st.expander("Настройка отображения таблицы"):
+                selected_display_cols = st.multiselect(
+                    "Выберите поля для вывода:", 
+                    options=all_cols, 
+                    default=[c for c in default_cols if c in all_cols]
+                )
+            
+            if selected_display_cols:
+                st.dataframe(
+                    df[selected_display_cols].sort_values('compliance_rate', ascending=False) if 'compliance_rate' in selected_display_cols else df[selected_display_cols]
+                )
+            else:
+                st.warning("Выберите хотя бы одну колонку для отображения.")
+            
+            st.markdown("---")
+            
+            # --- 2. STATISTICAL ANALYSIS (2 Columns) ---
+            col_left, col_right = st.columns(2)
+            
+            with col_left:
+                st.subheader("2. Матрица корреляции")
+                num_df = df.select_dtypes(include=[np.number]).drop(columns=['embedding_order'], errors='ignore')
+                
+                # High-End Heatmap
+                plt.figure(figsize=(10, 8), facecolor='#0d1117')
+                sns.set(rc={'axes.facecolor':'#0d1117', 'figure.facecolor':'#0d1117', 'text.color':'#c9d1d9'})
+                ax = sns.heatmap(num_df.corr(), annot=True, cmap='YlOrBr', fmt=".2f", 
+                                 cbar=False, annot_kws={"size": 10, "weight": "bold"})
+                plt.xticks(color='#8b949e', rotation=45, ha='right')
+                plt.yticks(color='#8b949e')
+                st.pyplot(plt.gcf())
+                plt.close()
+
+            with col_right:
+                st.subheader("3. Дисперсия признаков")
+                variances = num_df.var().sort_values(ascending=False).head(10)
+                fig_var = px.bar(
+                    x=variances.index, 
+                    y=variances.values, 
+                    labels={'x': 'Признак', 'y': 'Дисперсия'},
+                    template='plotly_dark',
+                    color_discrete_sequence=['#f9a03f']
+                )
+                fig_var.update_layout(
+                    plot_bgcolor='rgba(0,0,0,0)',
+                    paper_bgcolor='rgba(0,0,0,0)',
+                    margin=dict(l=20, r=20, t=40, b=20)
+                )
+                st.plotly_chart(fig_var, use_container_width=True)
+
+            st.markdown("---")
+            
+            # --- 3. MACHINE LEARNING (Importance & SHAP) ---
+            st.subheader("4. Факторный анализ (Random Forest)")
+            
+            if len(df) > 1:
+                # Optimized call with caching
+                model, shap_values, imp_df, X_features = train_and_get_shap(df)
+                
+                col_ml1, col_ml2 = st.columns(2)
+                
+                with col_ml1:
+                    fig_imp = px.bar(
+                        imp_df, x='Importance', y='Feature', orientation='h', 
+                        title="Вес признаков в оценке качества",
+                        template='plotly_dark',
+                        color_discrete_sequence=['#ff8c00']
+                    )
+                    fig_imp.update_layout(plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)')
+                    st.plotly_chart(fig_imp, use_container_width=True)
+                
+                with col_ml2:
+                    st.write("**Влияние признаков (SHAP Analysis)**")
+                    try:
+                        plt.figure(figsize=(10, 6), facecolor='#0d1117')
+                        shap.summary_plot(shap_values, X_features, show=False, plot_type="bar", color='#f9a03f')
+                        plt.gcf().set_facecolor('#0d1117')
+                        ax = plt.gca()
+                        ax.set_facecolor('#0d1117')
+                        ax.xaxis.label.set_color('#c9d1d9')
+                        ax.yaxis.label.set_color('#c9d1d9')
+                        ax.tick_params(colors='#8b949e')
+                        st.pyplot(plt.gcf())
+                        plt.close()
+                    except Exception as e:
+                        st.error(f"Ошибка SHAP: {e}")
+            else:
+                st.warning("Недостаточно данных для обучения модели RF (нужно хотя бы 2 объекта).")
+
+            # --- 4. CONCLUSIONS & EXPORT ---
+            st.markdown("---")
+            st.subheader("5. Итоговые выводы и экспорт")
+            
+            if len(df) > 1:
+                top_3 = imp_df.iloc[-3:][::-1]
+                cols = st.columns(3)
+                for i, (_, row) in enumerate(top_3.iterrows()):
+                    cols[i].info(f"**{row['Feature']}**\n\nВлияние на рейтинг: {row['Importance']:.1%}")
+
+            c1, c2 = st.columns([1, 4])
+            with c1:
+                csv = df.to_csv(index=False).encode('utf-8-sig')
+                st.download_button("Скачать Full Dataset (CSV)", csv, "sapere_dataset.csv", "text/csv")
+            with c2:
+                st.write("Датасет включает все извлеченные лингвистические признаки и оценки AI.")
+
+    except Exception as e:
+        st.error(f"Критическая ошибка аналитики: {e}")
+        st.exception(e)
+
+with tabs[4]:
+    st.header("Интеллектуальная генерация и редактор")
+    
+    # --- UNIFIED AI WORKSTATION ---
+    gen_cols = adjustable_columns(2, labels=["Панель управления ИИ", "Интеллектуальный редактор"])
+
+    with gen_cols[0]:
+        st.subheader("Инструментарий")
+        
+        # 1. Context Source (File Uploader)
+        uploaded_file = st.file_uploader(
+            "Загрузить образец / контекст", 
+            type=["pdf", "docx", "csv", "xlsx", "png", "jpg", "jpeg"], 
+            key="gen_doc_uploader"
+        )
+        if uploaded_file is not None:
+            file_id = f"gen_{uploaded_file.name}_{uploaded_file.size}"
+            if st.session_state.get("gen_current_file_id") != file_id:
+                st.session_state["gen_file_bytes"] = uploaded_file.getvalue()
+                st.session_state["gen_file_name"] = uploaded_file.name
+                st.session_state["gen_current_file_id"] = file_id
+                # Reset editor if it was for a different file, but NOT if it was generated
+                if "gen_is_ai_generated" not in st.session_state:
+                    for key in ["gen_docx_html", "gen_df_data"]:
+                        if key in st.session_state: del st.session_state[key]
+
+        st.markdown("---")
+
+        # 2. AI Expansion Agent (Gap Analysis)
+        st.write("**Анализ и дополнение курса**")
+        if st.button("Найти методические пробелы"):
+            try:
+                df_gap = pd.read_sql("SELECT * FROM opit_files ORDER BY embedding_order", engine)
+                if df_gap.empty:
+                    st.warning("База пуста. Проведите модерацию в Аналитическом цикле.")
+                else:
+                    with st.spinner("ИИ анализирует структуру..."):
+                        topics_info = []
+                        for _, r in df_gap.iterrows():
+                            t = str(r['topic']) if r['topic'] else "Без темы"
+                            a = str(r['annotation'])[:100] if r['annotation'] else "Без описания"
+                            topics_info.append({"topic": t, "annotation": a})
+                        
+                        prompt_gaps = f"""Ты - эксперт-методист. Найди 3 логических разрыва в списке тем курса: {json.dumps(topics_info, ensure_ascii=False)}
+                        Верни JSON: {{"gaps": [[{{"after": "A", "before": "B", "subject": "S", "new_topic": "T"}}]]}}"""
+                        gap_res = call_ai(prompt_gaps, is_json=True)
+                        if gap_res and 'gaps' in gap_res:
+                            st.session_state['ai_gaps'] = gap_res['gaps']
+            except Exception as e: st.error(f"Ошибка аудита: {e}")
+
+        if 'ai_gaps' in st.session_state:
+            selected_gap = st.selectbox("Выберите разрыв:", options=st.session_state['ai_gaps'], 
+                                        format_func=lambda x: f"{x['new_topic']} (между {x['after']} и {x['before']})")
+            if st.button("Заполнить разрыв"):
+                with st.spinner("Генерация..."):
+                    gen_prompt = f"Сгенерируй подробный HTML-материал (h2, p, ul) по теме '{selected_gap['new_topic']}' для предмета '{selected_gap['subject']}'."
+                    html = call_ai(gen_prompt)
+                    if html:
+                        st.session_state["gen_docx_html"] = html
+                        st.session_state["gen_file_name"] = f"AI_{selected_gap['new_topic'].replace(' ', '_')}.docx"
+                        st.session_state["gen_is_ai_generated"] = True
+                        st.rerun()
+
+        st.markdown("---")
+
+        # 3. Free-form Generation
+        st.write("**Свободная генерация**")
+        custom_prompt = st.text_area("Ваш запрос к ИИ", placeholder="Например: Напиши план лекции по квантовой физике...")
+        if st.button("Генерировать в редактор"):
+            if custom_prompt:
+                with st.spinner("ИИ пишет..."):
+                    gen_html = call_ai(f"Сгенерируй учебный материал в формате HTML (h2, p, ul, table) по запросу: {custom_prompt}")
+                    if gen_html:
+                        st.session_state["gen_docx_html"] = gen_html
+                        st.session_state["gen_file_name"] = "AI_Custom_Material.docx"
+                        st.session_state["gen_is_ai_generated"] = True
+                        st.rerun()
+
+        st.markdown("---")
+
+        # 4. Save to Database
+        if "gen_docx_html" in st.session_state:
+            st.write("**Сохранение**")
+            if st.button("Модерировать и сохранить в БД"):
+                with st.spinner("Анализ и запись..."):
+                    clean_text = re.sub('<[^<]+?>', '', st.session_state["gen_docx_html"])
+                    mod_res = call_ai(f"{METHODOLOGY_PROMPT}\n\nТЕКСТ:\n{clean_text[:4000]}", is_json=True)
+                    if mod_res:
+                        row = {
+                            "id": hashlib.md5(f"ai_edit_{datetime.now().timestamp()}".encode()).hexdigest(),
+                            "file_name": st.session_state.get("gen_file_name", "generated.docx"),
+                            "extension": ".docx", "text_content": clean_text, "processed_at": datetime.now(),
+                            "subject": mod_res.get('subject', 'Educational'), "topic": mod_res.get('topic', 'AI Generated'),
+                            "annotation": mod_res.get('annotation', 'Сгенерировано и отредактировано в системе'),
+                            "compliance_rate": float(mod_res.get('compliance_rate', 0)),
+                            "usage_allowed": mod_res.get('usage_allowed', 'no'),
+                            "issues": json.dumps(mod_res.get('issues', []), ensure_ascii=False),
+                            "recommendations": json.dumps(mod_res.get('recommendations', []), ensure_ascii=False)
+                        }
+                        with engine.begin() as conn:
+                            pd.DataFrame([row]).to_sql("opit_files", conn, if_exists="append", index=False)
+                        st.success("Объект добавлен в репозиторий!")
+                        prepare_analysis_df.clear()
+                        train_and_get_shap.clear()
+
+    with gen_cols[1]:
+        if "gen_docx_html" in st.session_state:
+            st.subheader("Редактор (Quill)")
+            content = st_quill(value=st.session_state["gen_docx_html"], html=True, key="gen_quill_editor")
+            if content: st.session_state["gen_docx_html"] = content
+            
+            st.markdown(" ")
+            if st.button("Экспорт в DOCX"):
+                buf = html2docx(st.session_state["gen_docx_html"], title="Edited Document")
+                st.download_button("Скачать файл", buf.getvalue(), f"edited_{st.session_state.get('gen_file_name', 'document.docx')}", 
+                                   "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        
+        elif "gen_file_bytes" in st.session_state and st.session_state["gen_file_bytes"]:
+            f_bytes = st.session_state["gen_file_bytes"]
+            f_ext = st.session_state["gen_file_name"].split(".")[-1].lower()
+            if f_ext == "pdf": display_pdf(f_bytes)
+            elif f_ext == "docx":
+                if "gen_docx_html" not in st.session_state:
+                    st.session_state["gen_docx_html"] = mammoth.convert_to_html(io.BytesIO(f_bytes)).value
+                st.rerun()
+            elif f_ext in ["csv", "xlsx"]:
+                if "gen_df_data" not in st.session_state:
+                    st.session_state["gen_df_data"] = pd.read_csv(io.BytesIO(f_bytes)) if f_ext == "csv" else pd.read_excel(io.BytesIO(f_bytes))
+                df = st.session_state["gen_df_data"]
+                theta_spreadsheet_editor(data=[df.columns.tolist()] + df.values.tolist(), key="gen_theta_sheet")
+            elif f_ext in ["png", "jpg", "jpeg"]:
+                theta_image_editor(image_file=base64.b64encode(f_bytes).decode(), key="gen_theta_img")
+        else:
+            st.info("Используйте панель слева для генерации или загрузки документа.")
+
