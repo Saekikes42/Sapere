@@ -1,0 +1,31 @@
+# Local Python environments and runtimes
+.venv/
+venv/
+.python39/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Secrets and editor settings
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+
+# User documents and runtime output
+downloaded_docs/*
+!downloaded_docs/.gitkeep
+logs/*
+!logs/.gitkeep
+*.log
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+
+# Generated source snapshots and local notes
+all_code.md
+project_summary.md
+*.mp4
+*.zip
