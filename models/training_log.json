@@ -1,0 +1,16 @@
+[
+  {
+    "file": "C:\\sapere-2\\models\\label_difficulty_20260610_083139.joblib",
+    "target": "label_difficulty",
+    "model_name": "KNN (k=5)",
+    "timestamp": "20260610_083139",
+    "metrics": {
+      "Алгоритм": "KNN (k=5)",
+      "Accuracy": 0.7692,
+      "Precision": 0.7115,
+      "Recall": 0.7692,
+      "F1-Score": 0.7385,
+      "ROC-AUC": 0.8686
+    }
+  }
+]
